@@ -47,6 +47,7 @@ import {
   enableComponentPerformanceTrack,
   enableAsyncDebugInfo,
   enableFlightWeakThenables,
+  enableFlightLedgers,
 } from 'shared/ReactFeatureFlags';
 
 import {
@@ -92,6 +93,16 @@ import {
   ASYNC_ITERATOR,
   REACT_FRAGMENT_TYPE,
 } from 'shared/ReactSymbols';
+
+import type {
+  LedgerCell,
+  LedgerKind,
+  Ledger,
+  LedgerUnitDeclaration,
+  LedgerDeltaRow,
+  LedgerReferencesRow,
+} from 'shared/ReactLedgers';
+import {MASK_LEDGER} from 'shared/ReactLedgers';
 
 import getComponentNameFromType from 'shared/getComponentNameFromType';
 
@@ -159,6 +170,9 @@ const PENDING_WEAK = 'pending_weak';
 const BLOCKED = 'blocked';
 const RESOLVED_MODEL = 'resolved_model';
 const RESOLVED_MODULE = 'resolved_module';
+// A ledger total whose response has closed; the reduction runs at its first
+// read.
+const RESOLVED_LEDGER = 'resolved_ledger';
 const INITIALIZED = 'fulfilled';
 const ERRORED = 'rejected';
 // Means it never resolves, even when the connection closes. The shared
@@ -218,6 +232,15 @@ type ResolvedModuleChunk<T> = {
   _debugInfo: ReactDebugInfo, // DEV-only
   then(resolve: (T) => mixed, reject?: (mixed) => mixed): void,
 };
+type ResolvedLedgerChunk<T> = {
+  status: 'resolved_ledger',
+  value: LedgerTotalRecord,
+  reason: Response,
+  _children: Array<SomeChunk<any>> | ProfilingResult, // Profiling-only
+  _debugChunk: null, // DEV-only
+  _debugInfo: ReactDebugInfo, // DEV-only
+  then(resolve: (T) => mixed, reject?: (mixed) => mixed): void,
+};
 type InitializedChunk<T> = {
   status: 'fulfilled',
   value: T,
@@ -262,6 +285,7 @@ type SomeChunk<T> =
   | BlockedChunk<T>
   | ResolvedModelChunk<T>
   | ResolvedModuleChunk<T>
+  | ResolvedLedgerChunk<T>
   | InitializedChunk<T>
   | ErroredChunk<T>
   | HaltedChunk<T>;
@@ -297,6 +321,9 @@ function reactPromiseThen<T>(
       break;
     case RESOLVED_MODULE:
       initializeModuleChunk(chunk);
+      break;
+    case RESOLVED_LEDGER:
+      initializeLedgerChunk(chunk);
       break;
   }
   if (__DEV__ && enableAsyncDebugInfo) {
@@ -391,6 +418,8 @@ type Response = {
   _closedReason: mixed,
   _allowPartialStream: boolean,
   _tempRefs: void | TemporaryReferenceSet, // the set temporary references can be resolved from
+  // The indexed ledger graph, created lazily by the first ledger row.
+  _ledgers: null | ResponseLedgers,
   _timeOrigin: number, // Profiling-only
   _pendingInitialRender: null | TimeoutID, // Profiling-only,
   _pendingChunks: number, // DEV-only
@@ -465,6 +494,9 @@ function readChunk<T>(chunk: SomeChunk<T>): T {
       break;
     case RESOLVED_MODULE:
       initializeModuleChunk(chunk);
+      break;
+    case RESOLVED_LEDGER:
+      initializeLedgerChunk(chunk);
       break;
   }
   // The status might have changed after initialization.
@@ -1295,6 +1327,8 @@ export function reportGlobalError(
   const response = unwrapWeakResponse(weakResponse);
   response._closed = true;
   response._closedReason = error;
+  // A closed response is settlement for every ledger total still pending.
+  resolveLedgerTotalsAtClose(response);
   response._chunks.forEach(chunk => {
     // If this chunk was already resolved or errored, it won't
     // trigger an error but if it wasn't then we need to
@@ -2707,6 +2741,28 @@ function parseModelString(
         // Symbol
         return Symbol.for(value.slice(2));
       }
+      case 'y': {
+        if (enableFlightLedgers) {
+          // Ledger total. Its declaration precedes this row, so the promise
+          // it resolves to already exists.
+          const record = getResponseLedgers(response).totals.get(
+            parseInt(value.slice(2), 16),
+          );
+          if (record !== undefined) {
+            const chunk = record.chunk;
+            if (enableProfilerTimer && enableComponentPerformanceTrack) {
+              if (
+                initializingChunk !== null &&
+                isArray(initializingChunk._children)
+              ) {
+                initializingChunk._children.push(chunk);
+              }
+            }
+            return chunk;
+          }
+        }
+        return undefined;
+      }
       case 'h': {
         // Server Reference
         const ref = value.slice(2);
@@ -2995,6 +3051,9 @@ function ResponseInstance(
   this._closedReason = null;
   this._allowPartialStream = allowPartialStream;
   this._tempRefs = temporaryReferences;
+  if (enableFlightLedgers) {
+    this._ledgers = null;
+  }
   if (enableProfilerTimer && enableComponentPerformanceTrack) {
     this._timeOrigin = 0;
     this._pendingInitialRender = null;
@@ -3942,6 +4001,351 @@ function resolveHint<Code: HintCode>(
   dispatchHint(code, hintModel);
 }
 
+// Flight Ledgers: the response indexes the ledger rows (`K`, `Y`, `Q`, `Z`,
+// `F`) as they arrive, and a ledger total is reduced from that graph once
+// the response has closed and the total is read.
+
+// One declared ledger total: the promise its model references resolve
+// to, plus its ledger type, which the reduction reads.
+type LedgerTotalRecord = {
+  chunk: SomeChunk<mixed>,
+  type: Ledger<empty>,
+};
+
+// One unit's indexed records: its creator and the units it created, the
+// ledger totals it carries when it is an occurrence, its cells and its
+// references. Creator and ledger totals are held as records, resolved
+// when the declaration arrived, since every row it names preceded it. A
+// reference stays an id: its target may never carry a row.
+type UnitRecord = {
+  creator: null | UnitRecord,
+  children: null | Array<UnitRecord>,
+  totals: null | Array<LedgerTotalRecord>,
+  cells: null | Map<Ledger<empty>, LedgerCell>,
+  references: null | Array<number>,
+};
+
+// The indexed ledger graph, one lazily-created record per response.
+type ResponseLedgers = {
+  totals: Map<number, LedgerTotalRecord>,
+  types: Map<number, Ledger<empty>>,
+  units: Map<number, UnitRecord>,
+};
+
+function getResponseLedgers(response: Response): ResponseLedgers {
+  let ledgers = response._ledgers;
+  if (ledgers === null) {
+    response._ledgers = ledgers = {
+      totals: new Map(),
+      types: new Map(),
+      units: new Map(),
+    };
+  }
+  return ledgers;
+}
+
+// Settlement: the response closed, which is the one moment a captured
+// ledger's promise resolves. Every ledger total still pending now holds
+// its record, like a resolved model holds its row; one already read reduces
+// now, and one nobody has read reduces at its first read, if ever. The
+// caller has already marked the response closed.
+function resolveLedgerTotalsAtClose(response: Response): void {
+  if (!enableFlightLedgers) {
+    return;
+  }
+  const ledgers = response._ledgers;
+  if (ledgers !== null) {
+    ledgers.totals.forEach(record => {
+      const chunk = record.chunk;
+      if (chunk.status === PENDING) {
+        releasePendingChunk(response, chunk);
+        const resolveListeners = chunk.value;
+        const rejectListeners = chunk.reason;
+        // A chunk changes status in place; Flow cannot retag a disjoint union.
+        const resolvedChunk: ResolvedLedgerChunk<mixed> = chunk as any;
+        resolvedChunk.status = RESOLVED_LEDGER;
+        resolvedChunk.value = record;
+        resolvedChunk.reason = response;
+        if (resolveListeners !== null) {
+          initializeLedgerChunk(resolvedChunk);
+          wakeChunkIfInitialized(
+            response,
+            chunk,
+            resolveListeners,
+            rejectListeners,
+          );
+        }
+      }
+    });
+  }
+}
+
+// The reduction, run at the ledger total's first read after the close: the
+// total is a detached snapshot, never a live cell.
+function initializeLedgerChunk<T>(chunk: ResolvedLedgerChunk<T>): void {
+  const record = chunk.value;
+  const response = chunk.reason;
+  const total = reduceLedgerCell(getResponseLedgers(response), record).state;
+  // A chunk changes status in place; Flow cannot retag a disjoint union.
+  const initializedChunk: InitializedChunk<mixed> = chunk as any;
+  initializedChunk.status = INITIALIZED;
+  initializedChunk.value = total;
+  initializedChunk.reason = null;
+  if (__DEV__) {
+    processChunkDebugInfo(response, initializedChunk, total);
+  }
+}
+
+// TODO: Only the mask kind exists yet; the other kinds land in a later PR.
+function resolveLedgerType(response: Response, id: number, row: string): void {
+  let kind: LedgerKind;
+  switch (row.charCodeAt(0)) {
+    case 49 /* "1" */:
+      kind = MASK_LEDGER;
+      break;
+    default:
+      // The producer declares the mask kind.
+      return;
+  }
+  getResponseLedgers(response).types.set(id, {kind});
+}
+
+// TODO: Only the mask kind exists yet; the other kinds land in a later PR.
+function createLedgerCell(type: Ledger<empty>): LedgerCell {
+  return {kind: 1, state: 0};
+}
+
+// Joins another cell's whole state, or a decoded wire delta, into `acc.state`.
+// The source has the accumulator's kind by construction; the `typeof` refines
+// it where Flow cannot correlate the two. A mask state of 0 joins as nothing.
+// TODO: Only the mask kind exists yet; the other kinds land in a later PR.
+function joinLedgerState(acc: LedgerCell, state: mixed): void {
+  if (typeof state === 'number') {
+    acc.state = (acc.state | state) >>> 0;
+  }
+}
+
+function resolveLedgerTotal(response: Response, id: number, row: string): void {
+  const typeId = parseInt(row, 16);
+  const ledgers = getResponseLedgers(response);
+  const type = ledgers.types.get(typeId);
+  if (type === undefined) {
+    // Every ledger total names a type declared before it.
+    return;
+  }
+  // The ledger total's promise is pending from its declaration and
+  // resolves at settlement, when the response closes.
+  ledgers.totals.set(id, {
+    chunk: createPendingChunk(response),
+    type,
+  });
+}
+
+// A unit's declaration row creates its record, the only row that does. Every
+// row body is parsed by the same code that parses a model row.
+function resolveUnitDeclaration(
+  response: Response,
+  id: number,
+  row: string,
+): void {
+  const declaration: LedgerUnitDeclaration = parseModel(response, row);
+  const ledgers = getResponseLedgers(response);
+  const units = ledgers.units;
+  const unit: UnitRecord = {
+    creator: null,
+    children: null,
+    totals: null,
+    cells: null,
+    references: null,
+  };
+  units.set(id, unit);
+  const creatorId = declaration[0];
+  if (creatorId !== null) {
+    // The creator's declaration preceded this one.
+    const creator = units.get(parseInt(creatorId, 16));
+    if (creator !== undefined) {
+      unit.creator = creator;
+      let children = creator.children;
+      if (children === null) {
+        creator.children = children = [];
+      }
+      children.push(unit);
+    }
+  }
+  const totalIds = declaration[1];
+  if (totalIds.length !== 0) {
+    // Every ledger total's declaration preceded the unit's.
+    const totals = ledgers.totals;
+    const list: Array<LedgerTotalRecord> = [];
+    for (let i = 0; i < totalIds.length; i++) {
+      const record = totals.get(parseInt(totalIds[i], 16));
+      if (record !== undefined) {
+        list.push(record);
+      }
+    }
+    unit.totals = list;
+  }
+}
+
+// A unit's delta row joins into its cell for the ledger.
+function resolveLedgerDelta(response: Response, id: number, row: string): void {
+  const delta: LedgerDeltaRow = parseModel(response, row);
+  const ledgers = getResponseLedgers(response);
+  const unit = ledgers.units.get(id);
+  if (unit === undefined) {
+    // The unit's declaration preceded this row.
+    return;
+  }
+  const type = ledgers.types.get(parseInt(delta[0], 16));
+  if (type === undefined) {
+    // The ledger's declaration preceded this row.
+    return;
+  }
+  let cells = unit.cells;
+  if (cells === null) {
+    unit.cells = cells = new Map();
+  }
+  let cell = cells.get(type);
+  if (cell === undefined) {
+    cells.set(type, (cell = createLedgerCell(type)));
+  }
+  joinLedgerState(cell, delta[1]);
+}
+
+// A unit's references row adds to its references.
+function resolveUnitReferences(
+  response: Response,
+  id: number,
+  row: string,
+): void {
+  const references: LedgerReferencesRow = parseModel(response, row);
+  const unit = getResponseLedgers(response).units.get(id);
+  if (unit === undefined) {
+    // The unit's declaration preceded this row.
+    return;
+  }
+  let list = unit.references;
+  if (list === null) {
+    unit.references = list = [];
+  }
+  for (let i = 0; i < references.length; i++) {
+    list.push(parseInt(references[i], 16));
+  }
+}
+
+// The reduction: every unit whose writes belong to one ledger total,
+// joined into one total. For the ledger total's type, a unit's scope is the
+// nearest unit on its creator chain, itself included, carrying a captured
+// ledger of the type. A unit's writes belong to the ledger total when its
+// scope lists it, and a reference includes the target's same-scope subtree.
+function reduceLedgerCell(
+  ledgers: ResponseLedgers,
+  total: LedgerTotalRecord,
+): LedgerCell {
+  const type = total.type;
+  // Fresh per reduction: the total handed out never aliases a live cell.
+  const acc = createLedgerCell(type);
+  const units = ledgers.units;
+
+  // A unit's scope for this type; null when no unit on its creator chain
+  // carries a ledger total of the type.
+  function scopeOf(unit: UnitRecord): null | UnitRecord {
+    let current: null | UnitRecord = unit;
+    while (current !== null) {
+      const totals = current.totals;
+      if (totals !== null) {
+        for (let i = 0; i < totals.length; i++) {
+          if (totals[i].type === type) {
+            return current;
+          }
+        }
+      }
+      current = current.creator;
+    }
+    return null;
+  }
+
+  // Whether a scope lists this ledger total.
+  function isOwn(scope: null | UnitRecord): boolean {
+    if (scope === null) {
+      return false;
+    }
+    const totals = scope.totals;
+    if (totals === null) {
+      // A scope was chosen for carrying a ledger total of the type.
+      return false;
+    }
+    for (let i = 0; i < totals.length; i++) {
+      if (totals[i] === total) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  const visited: Set<UnitRecord> = new Set();
+  const queue: Array<number> = [];
+
+  // Join a unit's cell for this type and queue every target it referenced.
+  function join(unit: UnitRecord): void {
+    visited.add(unit);
+    const cells = unit.cells;
+    if (cells !== null) {
+      const cell = cells.get(type);
+      if (cell !== undefined) {
+        joinLedgerState(acc, cell.state);
+      }
+    }
+    const references = unit.references;
+    if (references !== null) {
+      for (let i = 0; i < references.length; i++) {
+        queue.push(references[i]);
+      }
+    }
+  }
+
+  // Phase one: every unit whose scope is the ledger total's own.
+  units.forEach(unit => {
+    if (isOwn(scopeOf(unit))) {
+      join(unit);
+    }
+  });
+  // Phase two: a reference includes its target's same-scope subtree, as if
+  // the target sat at the referencing position. A visited target already
+  // joined, in phase one or through an earlier reference; a unit whose scope
+  // differs from the target's ends the walk there, since every unit under it
+  // does too. Both worklists grow while they are walked.
+  for (let i = 0; i < queue.length; i++) {
+    const target = units.get(queue[i]);
+    if (target === undefined) {
+      // No record: it recorded nothing, and neither did anything it created.
+      continue;
+    }
+    if (visited.has(target)) {
+      continue;
+    }
+    const scope = scopeOf(target);
+    const subtree: Array<UnitRecord> = [target];
+    for (let j = 0; j < subtree.length; j++) {
+      const unit = subtree[j];
+      if (visited.has(unit)) {
+        continue;
+      }
+      if (scopeOf(unit) !== scope) {
+        continue;
+      }
+      join(unit);
+      const children = unit.children;
+      if (children !== null) {
+        for (let k = 0; k < children.length; k++) {
+          subtree.push(children[k]);
+        }
+      }
+    }
+  }
+  return acc;
+}
+
 const supportsCreateTask = __DEV__ && !!(console as any).createTask;
 
 type FakeFunction<T> = (() => T) => T;
@@ -4418,8 +4822,12 @@ function resolveDebugModel(
     // We shouldn't really get debug info late. It's too late to add it after we resolved.
     return;
   }
-  if (parentChunk.status === RESOLVED_MODULE) {
-    // We don't expect to get debug info on modules.
+  if (
+    parentChunk.status === RESOLVED_MODULE ||
+    parentChunk.status === RESOLVED_LEDGER
+  ) {
+    // We don't expect to get debug info on modules, and a ledger total's
+    // chunk is never in the chunk map for a debug row to target.
     return;
   }
   const previousChunk = parentChunk._debugChunk;
@@ -5276,6 +5684,41 @@ function processFullStringRow(
       stopStream(response, id, row);
       return;
     }
+    case 75 /* "K" */: {
+      if (enableFlightLedgers) {
+        resolveLedgerType(response, id, row);
+        return;
+      }
+      // Fallthrough to be treated as model data.
+    }
+    case 89 /* "Y" */: {
+      if (enableFlightLedgers) {
+        resolveLedgerTotal(response, id, row);
+        return;
+      }
+      // Fallthrough to be treated as model data.
+    }
+    case 81 /* "Q" */: {
+      if (enableFlightLedgers) {
+        resolveUnitDeclaration(response, id, row);
+        return;
+      }
+      // Fallthrough to be treated as model data.
+    }
+    case 90 /* "Z" */: {
+      if (enableFlightLedgers) {
+        resolveLedgerDelta(response, id, row);
+        return;
+      }
+      // Fallthrough to be treated as model data.
+    }
+    case 70 /* "F" */: {
+      if (enableFlightLedgers) {
+        resolveUnitReferences(response, id, row);
+        return;
+      }
+      // Fallthrough to be treated as model data.
+    }
     // Fallthrough
     default: /* """ "{" "[" "t" "f" "n" "0" - "9" */ {
       if (__DEV__ && row === '') {
@@ -5673,6 +6116,8 @@ export function close(weakResponse: WeakResponse): void {
   if (response._allowPartialStream) {
     // For partial streams, we halt pending chunks instead of erroring them.
     response._closed = true;
+    // The transport completed: settlement for every pending ledger total.
+    resolveLedgerTotalsAtClose(response);
     response._chunks.forEach(chunk => {
       if (
         chunk.status === PENDING ||
