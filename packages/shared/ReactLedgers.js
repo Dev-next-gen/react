@@ -7,10 +7,13 @@
  * @flow
  */
 
-// TODO: Only the mask kind exists yet; the other kinds land in a later PR.
+export const BIT_LEDGER = 0;
 export const MASK_LEDGER = 1;
+export const MIN_LEDGER = 2;
+export const MAX_LEDGER = 3;
+export const SET_LEDGER = 4;
 
-export type LedgerKind = 1;
+export type LedgerKind = 0 | 1 | 2 | 3 | 4;
 
 // A ledger identifies which writes a capture should collect. Each capture
 // computes its own accumulated value.
@@ -27,12 +30,19 @@ export type LedgerTotals<V: $ReadOnlyArray<Ledger<empty>>> = {
 
 // Used to combine writes within a server flush and to accumulate totals on
 // the client.
-// TODO: Only the mask kind exists yet; the other kinds land in a later PR.
-export type LedgerCell = {+kind: 1, state: number};
+export type LedgerCell =
+  | {+kind: 0, state: boolean}
+  | {+kind: 1, state: number}
+  | {+kind: 2, state: null | number}
+  | {+kind: 3, state: null | number}
+  | {+kind: 4, state: Set<mixed>};
 
-// Wire format for the writes combined in a flush.
-// TODO: Only the mask kind exists yet; the other kinds land in a later PR.
-export type LedgerDelta = number | string;
+// The wire forms, shared by the server's emitter and the client's decoder. A
+// set entry is written by the same scalar serializers the model uses.
+export type LedgerEntryWireForm = string | number | boolean | null;
+// A bit is `1`; a mask, minimum or maximum is its number; a set is an array
+// of its entries.
+export type LedgerDelta = number | string | Array<LedgerEntryWireForm>;
 
 // Row IDs in ledger records are hexadecimal strings.
 

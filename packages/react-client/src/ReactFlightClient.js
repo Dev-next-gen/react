@@ -102,7 +102,13 @@ import type {
   LedgerDeltaRow,
   LedgerReferencesRow,
 } from 'shared/ReactLedgers';
-import {MASK_LEDGER} from 'shared/ReactLedgers';
+import {
+  BIT_LEDGER,
+  MASK_LEDGER,
+  MIN_LEDGER,
+  MAX_LEDGER,
+  SET_LEDGER,
+} from 'shared/ReactLedgers';
 
 import getComponentNameFromType from 'shared/getComponentNameFromType';
 
@@ -4085,7 +4091,9 @@ function resolveLedgerTotalsAtClose(response: Response): void {
 function initializeLedgerChunk<T>(chunk: ResolvedLedgerChunk<T>): void {
   const record = chunk.value;
   const response = chunk.reason;
-  const total = reduceLedgerCell(getResponseLedgers(response), record).state;
+  const state = reduceLedgerCell(getResponseLedgers(response), record).state;
+  // An unwritten min/max ledger resolves to undefined.
+  const total = state === null ? undefined : state;
   // A chunk changes status in place; Flow cannot retag a disjoint union.
   const initializedChunk: InitializedChunk<mixed> = chunk as any;
   initializedChunk.status = INITIALIZED;
@@ -4096,32 +4104,97 @@ function initializeLedgerChunk<T>(chunk: ResolvedLedgerChunk<T>): void {
   }
 }
 
-// TODO: Only the mask kind exists yet; the other kinds land in a later PR.
 function resolveLedgerType(response: Response, id: number, row: string): void {
   let kind: LedgerKind;
   switch (row.charCodeAt(0)) {
+    case 48 /* "0" */:
+      kind = BIT_LEDGER;
+      break;
     case 49 /* "1" */:
       kind = MASK_LEDGER;
       break;
+    case 50 /* "2" */:
+      kind = MIN_LEDGER;
+      break;
+    case 51 /* "3" */:
+      kind = MAX_LEDGER;
+      break;
+    case 52 /* "4" */:
+      kind = SET_LEDGER;
+      break;
     default:
-      // The producer declares the mask kind.
+      // The producer declares one of the five kinds.
       return;
   }
   getResponseLedgers(response).types.set(id, {kind});
 }
 
-// TODO: Only the mask kind exists yet; the other kinds land in a later PR.
 function createLedgerCell(type: Ledger<empty>): LedgerCell {
-  return {kind: 1, state: 0};
+  switch (type.kind) {
+    case BIT_LEDGER:
+      return {kind: 0, state: false};
+    case MASK_LEDGER:
+      return {kind: 1, state: 0};
+    case MIN_LEDGER:
+      return {kind: 2, state: null};
+    case MAX_LEDGER:
+      return {kind: 3, state: null};
+    default:
+      return {kind: 4, state: new Set()};
+  }
 }
 
 // Joins another cell's whole state, or a decoded wire delta, into `acc.state`.
-// The source has the accumulator's kind by construction; the `typeof` refines
-// it where Flow cannot correlate the two. A mask state of 0 joins as nothing.
-// TODO: Only the mask kind exists yet; the other kinds land in a later PR.
+// The source has the accumulator's kind by construction; each arm refines it
+// where Flow cannot correlate the two. A min/max state is never null because
+// a fresh cell accepts its first entry; a mask state of 0 joins as nothing.
 function joinLedgerState(acc: LedgerCell, state: mixed): void {
-  if (typeof state === 'number') {
-    acc.state = (acc.state | state) >>> 0;
+  switch (acc.kind) {
+    case BIT_LEDGER: {
+      acc.state = true;
+      break;
+    }
+    case MASK_LEDGER: {
+      if (typeof state === 'number') {
+        acc.state = (acc.state | state) >>> 0;
+      }
+      break;
+    }
+    case MIN_LEDGER: {
+      const accState = acc.state;
+      if (
+        typeof state === 'number' &&
+        (accState === null || state < accState)
+      ) {
+        acc.state = state;
+      }
+      break;
+    }
+    case MAX_LEDGER: {
+      const accState = acc.state;
+      if (
+        typeof state === 'number' &&
+        (accState === null || state > accState)
+      ) {
+        acc.state = state;
+      }
+      break;
+    }
+    default: {
+      const accState = acc.state;
+      if (isArray(state)) {
+        // A wire delta.
+        for (let i = 0; i < state.length; i++) {
+          accState.add(state[i]);
+        }
+      } else if (state instanceof Set) {
+        // Another cell's state.
+        state.forEach(entry => {
+          accState.add(entry);
+        });
+      }
+      break;
+    }
   }
 }
 

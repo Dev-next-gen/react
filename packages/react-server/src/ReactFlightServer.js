@@ -148,10 +148,17 @@ import type {
   Ledger,
   LedgerCell,
   LedgerTotals,
+  LedgerEntryWireForm,
   LedgerDelta,
   LedgerDeltaRow,
 } from 'shared/ReactLedgers';
 import type {UnitCacheHooks} from 'react-reconciler/src/ReactInternalTypes';
+import {
+  BIT_LEDGER,
+  MASK_LEDGER,
+  MIN_LEDGER,
+  MAX_LEDGER,
+} from 'shared/ReactLedgers';
 
 import {
   describeObjectForErrorMessage,
@@ -1031,24 +1038,77 @@ function ensureRequestLedgers(request: Request): RequestLedgers {
   return (request.ledgers = createRequestLedgers());
 }
 
-// TODO: Only the mask kind exists yet; the other kinds land in a later PR.
 function createLedgerCell(type: Ledger<empty>): LedgerCell {
-  return {kind: 1, state: 0};
+  switch (type.kind) {
+    case BIT_LEDGER:
+      return {kind: 0, state: false};
+    case MASK_LEDGER:
+      return {kind: 1, state: 0};
+    case MIN_LEDGER:
+      return {kind: 2, state: null};
+    case MAX_LEDGER:
+      return {kind: 3, state: null};
+    default:
+      return {kind: 4, state: new Set()};
+  }
 }
 
 // Returns whether the entry changed the accumulated value.
-// TODO: Only the mask kind exists yet; the other kinds land in a later PR.
 function accumulateLedgerEntry(cell: LedgerCell, entry: mixed): boolean {
-  if (typeof entry !== 'number') {
-    return false;
+  switch (cell.kind) {
+    case BIT_LEDGER: {
+      if (cell.state) {
+        return false;
+      }
+      cell.state = true;
+      return true;
+    }
+    case MASK_LEDGER: {
+      if (typeof entry !== 'number') {
+        // A mask entry was canonicalized to a number at the write.
+        return false;
+      }
+      const state = cell.state;
+      const next = (state | entry) >>> 0;
+      if (next === state) {
+        return false;
+      }
+      cell.state = next;
+      return true;
+    }
+    case MIN_LEDGER: {
+      if (typeof entry !== 'number') {
+        // A minimum entry is a number by the write's static type.
+        return false;
+      }
+      const state = cell.state;
+      if (state !== null && state <= entry) {
+        return false;
+      }
+      cell.state = entry;
+      return true;
+    }
+    case MAX_LEDGER: {
+      if (typeof entry !== 'number') {
+        // A maximum entry is a number by the write's static type.
+        return false;
+      }
+      const state = cell.state;
+      if (state !== null && state >= entry) {
+        return false;
+      }
+      cell.state = entry;
+      return true;
+    }
+    default: {
+      const state = cell.state;
+      if (state.has(entry)) {
+        return false;
+      }
+      state.add(entry);
+      return true;
+    }
   }
-  const state = cell.state;
-  const next = (state | entry) >>> 0;
-  if (next === state) {
-    return false;
-  }
-  cell.state = next;
-  return true;
 }
 
 function createUnit(request: Request, creator: null | Unit, id: number): Unit {
@@ -5298,6 +5358,35 @@ function declareLedgerTotal(
   return id;
 }
 
+// A set entry's wire form, by the same scalar serializers the model uses.
+function serializeLedgerEntry(entry: mixed): LedgerEntryWireForm {
+  switch (typeof entry) {
+    case 'string':
+      return escapeStringValue(entry);
+    case 'number':
+      return serializeNumber(entry);
+    case 'bigint':
+      return serializeBigInt(entry);
+    case 'symbol': {
+      // The write admits only registered symbols, so the name is never
+      // undefined.
+      const name = Symbol.keyFor(entry);
+      if (name != null) {
+        return serializeSymbolReference(name);
+      }
+    }
+    // Fallthrough
+    case 'undefined':
+      return serializeUndefined();
+    case 'boolean':
+      return entry;
+    default:
+      // Only null remains, and it needs no encoding beyond JSON's own: the
+      // write admits no object or function.
+      return null;
+  }
+}
+
 function emitUnitDeclaration(request: Request, unit: Unit): void {
   unit.declared = true;
   const creator = unit.creator;
@@ -5343,8 +5432,32 @@ function emitLedgerDeltas(
   dirtyDeltas: Map<Ledger<empty>, LedgerCell>,
 ): void {
   dirtyDeltas.forEach((cell, type) => {
-    // TODO: Only the mask kind exists yet; the other kinds land in a later PR.
-    const delta: LedgerDelta = serializeNumber(cell.state);
+    let delta: LedgerDelta;
+    switch (cell.kind) {
+      case BIT_LEDGER:
+        delta = 1;
+        break;
+      case MASK_LEDGER:
+        delta = serializeNumber(cell.state);
+        break;
+      case MIN_LEDGER:
+      case MAX_LEDGER: {
+        const state = cell.state;
+        if (state === null) {
+          // A cell is created with its first join, so it is never empty.
+          return;
+        }
+        delta = serializeNumber(state);
+        break;
+      }
+      default: {
+        const entries: Array<LedgerEntryWireForm> = [];
+        cell.state.forEach(entry => {
+          entries.push(serializeLedgerEntry(entry));
+        });
+        delta = entries;
+      }
+    }
     const typeId = ensureLedgerDeclared(request, ledgers, type);
     const row: LedgerDeltaRow = [typeId.toString(16), delta];
     emitLedgerChunk(
