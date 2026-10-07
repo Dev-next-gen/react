@@ -60,7 +60,8 @@ function manualDispatchScrollEndEvent(
   target: EventTarget,
 ) {
   const dispatchQueue: DispatchQueue = [];
-  const listeners = accumulateTwoPhaseListeners(inst, 'onScrollEnd');
+  // In React onScrollEnd doesn't bubble, same as the native event below.
+  const listeners = accumulateTwoPhaseListeners(inst, 'onScrollEnd', true);
   if (listeners.length > 0) {
     const event: ReactSyntheticEvent = new SyntheticUIEvent(
       'onScrollEnd',

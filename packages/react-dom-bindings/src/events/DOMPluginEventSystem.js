@@ -839,10 +839,14 @@ export function accumulateSinglePhaseListeners(
 export function accumulateTwoPhaseListeners(
   targetFiber: Fiber | null,
   reactName: string,
+  // For events that don't bubble in React. Capture listeners still run down
+  // the whole path, but only the target gets a bubble phase listener.
+  bubbleTargetOnly?: boolean,
 ): Array<DispatchListener> {
   const captureName = reactName + 'Capture';
   const listeners: Array<DispatchListener> = [];
   let instance = targetFiber;
+  let isTarget = true;
 
   // Accumulate all instances and listeners via the target -> root path.
   while (instance !== null) {
@@ -861,12 +865,15 @@ export function accumulateTwoPhaseListeners(
           createDispatchListener(instance, captureListener, currentTarget),
         );
       }
-      const bubbleListener = getListener(instance, reactName);
-      if (bubbleListener != null) {
-        listeners.push(
-          createDispatchListener(instance, bubbleListener, currentTarget),
-        );
+      if (isTarget || !bubbleTargetOnly) {
+        const bubbleListener = getListener(instance, reactName);
+        if (bubbleListener != null) {
+          listeners.push(
+            createDispatchListener(instance, bubbleListener, currentTarget),
+          );
+        }
       }
+      isTarget = false;
     }
     if (instance.tag === HostRoot) {
       return listeners;
